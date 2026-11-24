@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash   # -eo pipefail: tee orqali ham exit code saqlanadi
+
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
@@ -20,9 +24,16 @@ jobs:
         with:
           fetch-depth: 0
       - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/repo" \
+            zricethezav/gitleaks:latest detect --source /repo -v --redact --no-banner \
+            2>&1 | tee gitleaks.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-secrets
+          path: gitleaks.txt
+          if-no-files-found: ignore
 
   sast:
     runs-on: ubuntu-latest
@@ -37,19 +48,27 @@ jobs:
       - name: Bandit
         run: |
           pip install bandit
-          bandit -r app
+          bandit -r app 2>&1 | tee bandit.txt
       - name: Semgrep
         if: always()
         run: |
           pip install semgrep
           semgrep scan --error --config p/python --config p/flask --config p/secrets \
-            --sarif --output semgrep.sarif app/
+            --sarif-output=semgrep.sarif app/ 2>&1 | tee semgrep.txt
       - name: Upload Semgrep SARIF
         if: always() && hashFiles('semgrep.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
           category: semgrep
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-sast
+          path: |
+            bandit.txt
+            semgrep.txt
+          if-no-files-found: ignore
 
   sca:
     runs-on: ubuntu-latest
@@ -61,7 +80,13 @@ jobs:
       - name: pip-audit
         run: |
           pip install pip-audit
-          pip-audit -r app/requirements.txt --no-deps --disable-pip
+          pip-audit -r app/requirements.txt --no-deps --disable-pip --desc 2>&1 | tee pip-audit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-sca
+          path: pip-audit.txt
+          if-no-files-found: ignore
 
   dockerfile:
     runs-on: ubuntu-latest
@@ -71,38 +96,39 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
+          format: tty
+          output-file: hadolint.txt
       - name: Trivy config (Dockerfile misconfig)
+        if: always()
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: config
           scan-ref: .
           format: table
+          output: trivy-config.txt
+          severity: HIGH,CRITICAL
           exit-code: "1"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-dockerfile
+          path: |
+            hadolint.txt
+            trivy-config.txt
+          if-no-files-found: ignore
 
-  image:
-    needs: [secrets, sast, sca, dockerfile]
+  image-scan:   # needs YO'Q: har doim ishlaydi, hisobot to'liq bo'ladi
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
       security-events: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
       - name: Build
         run: docker build -t $IMAGE:${{ github.sha }} .
 
-      - name: Trivy image (log)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
-          format: table
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Trivy image (SARIF)
+      - name: Trivy SARIF (Security tab uchun)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ github.sha }}
@@ -141,29 +167,119 @@ jobs:
             zap-baseline.py -t "http://127.0.0.1:5000/user?name=test" \
             -r zap-report.html -I
 
+      - name: Trivy image (gate + matnli hisobot)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: table
+          output: trivy-image.txt
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zap-report
-          path: zap-report.html
+          name: report-image
+          path: |
+            trivy-image.txt
+            zap-report.html
+          if-no-files-found: ignore
 
-      - name: Login to GHCR
-        if: github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+  report:
+    needs: [secrets, sast, sca, dockerfile, image-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-*
+          merge-multiple: true
+          path: reports
+
+      - name: Build PDF report
+        env:
+          STATUS_SECRETS: ${{ needs.secrets.result }}
+          STATUS_SAST: ${{ needs.sast.result }}
+          STATUS_SCA: ${{ needs.sca.result }}
+          STATUS_DOCKERFILE: ${{ needs.dockerfile.result }}
+          STATUS_IMAGE: ${{ needs.image-scan.result }}
+        run: |
+          python3 - <<'PY'
+          import html, os, datetime
+
+          sections = [
+              ("Secrets - Gitleaks", "STATUS_SECRETS", "gitleaks.txt"),
+              ("SAST - Bandit", "STATUS_SAST", "bandit.txt"),
+              ("SAST - Semgrep", "STATUS_SAST", "semgrep.txt"),
+              ("SCA - pip-audit (zaif kutubxonalar)", "STATUS_SCA", "pip-audit.txt"),
+              ("Dockerfile - Hadolint", "STATUS_DOCKERFILE", "hadolint.txt"),
+              ("Dockerfile - Trivy config", "STATUS_DOCKERFILE", "trivy-config.txt"),
+              ("Image - Trivy (HIGH/CRITICAL)", "STATUS_IMAGE", "trivy-image.txt"),
+          ]
+
+          def read(name):
+              try:
+                  with open(os.path.join("reports", name), encoding="utf-8", errors="replace") as f:
+                      return f.read().strip() or "(bo'sh: topilma yo'q)"
+              except FileNotFoundError:
+                  return "(fayl yo'q: job shu qadamgacha yetmagan)"
+
+          colors = {"success": "#1a7f37", "failure": "#cf222e"}
+          out = ["<html><head><meta charset='utf-8'><style>",
+                 "body{font-family:sans-serif;margin:24px}",
+                 "h1{font-size:20px}h2{font-size:15px;margin-top:22px}",
+                 "pre{white-space:pre-wrap;word-break:break-all;font-size:8.5px;",
+                 "background:#f6f8fa;padding:8px;border:1px solid #d0d7de}",
+                 "</style></head><body>",
+                 "<h1>DevSecOps Security Report</h1>",
+                 "<p>Repo: %s<br>Commit: %s<br>Run: %s<br>Sana: %s</p>" % (
+                     os.environ.get("GITHUB_REPOSITORY", ""),
+                     os.environ.get("GITHUB_SHA", "")[:12],
+                     os.environ.get("GITHUB_RUN_ID", ""),
+                     datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))]
+          for title, env, fname in sections:
+              st = os.environ.get(env, "unknown")
+              out.append("<h2>%s - <span style='color:%s'>%s</span></h2>" % (
+                  html.escape(title), colors.get(st, "#9a6700"), html.escape(st.upper())))
+              out.append("<pre>%s</pre>" % html.escape(read(fname)))
+          out.append("</body></html>")
+          open("security-report.html", "w", encoding="utf-8").write("\n".join(out))
+          PY
+
+          google-chrome --headless=new --no-sandbox --disable-gpu --no-pdf-header-footer \
+            --print-to-pdf=security-report.pdf "file://$PWD/security-report.html"
+          ls -la security-report.*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: |
+            security-report.pdf
+            reports/
+
+  publish:   # faqat hamma skaner yashil bo'lsa va faqat main'da
+    needs: [secrets, sast, sca, dockerfile, image-scan]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t $IMAGE:${{ github.sha }} .
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Push
-        if: github.ref == 'refs/heads/main'
         run: docker push $IMAGE:${{ github.sha }}
-
       - uses: sigstore/cosign-installer@v3
-        if: github.ref == 'refs/heads/main'
-
       - name: Sign image (keyless)
-        if: github.ref == 'refs/heads/main'
         run: |
           REF=$(docker inspect --format '{{index .RepoDigests 0}}' $IMAGE:${{ github.sha }})
           cosign sign --yes "$REF"
