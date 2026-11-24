@@ -2,7 +2,7 @@ import sqlite3, os
 from flask import Flask, request
 
 app = Flask(__name__)
-AWS_KEY = "AKIAIOSFODNN7EXAMPLE"   # ataylab: secret
+AWS_KEY = "AKIAQWERTYUIOP234567"   # ataylab: secret
 
 @app.route("/user")
 def user():
