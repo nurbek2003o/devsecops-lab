@@ -1,6 +1,9 @@
-FROM python:3.8
+FROM python:3.12-slim
+RUN useradd -m appuser
 WORKDIR /app
-COPY app/ .
-RUN pip install -r requirements.txt
+COPY --chown=appuser:appuser app/ .
+RUN pip install --no-cache-dir -r requirements.txt && chown appuser:appuser /app
+USER appuser
+ENV HOST=0.0.0.0
 EXPOSE 5000
 CMD ["python", "app.py"]
