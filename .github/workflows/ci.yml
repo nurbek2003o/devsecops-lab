@@ -9,27 +9,32 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 defaults:
   run:
     shell: bash
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
-  MIN_SCORE: "4.0"     # o'tish chegarasi (5 dan)
+  IMAGE: ghcr.io/${{ github.repository }}   # GHCR nomi kichik harfda bo'lishi shart
+  SAST_FAIL_ON: MEDIUM                      # R2: shu daraja va undan yuqori yiqitadi
+  IMAGE_FAIL_ON: HIGH                       # R4: shu daraja va undan yuqori yiqitadi
 
 jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Gitleaks
         run: |
           docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/repo" \
-            zricethezav/gitleaks:latest detect --source /repo -v --redact --no-banner \
+            zricethezav/gitleaks:v8.30.1 detect --source /repo -v --redact --no-banner \
             --report-format json --report-path /repo/gitleaks.json || [ $? -eq 1 ]
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: report-secrets
@@ -42,27 +47,27 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Bandit
         run: |
-          pip install bandit
+          pip install bandit==1.9.4
           bandit -r app -f json -o bandit.json || [ $? -eq 1 ]
       - name: Semgrep
         if: always()
         run: |
-          pip install semgrep
+          pip install semgrep==1.185.0
           semgrep scan --config p/python --config p/flask --config p/secrets \
             --json-output=semgrep.json --sarif-output=semgrep.sarif app/
       - name: Upload Semgrep SARIF
         if: always() && hashFiles('semgrep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: semgrep.sarif
           category: semgrep
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: report-sast
@@ -74,16 +79,16 @@ jobs:
   sca:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: pip-audit
         run: |
-          pip install pip-audit
+          pip install pip-audit==2.10.1
           pip-audit -r app/requirements.txt --no-deps --disable-pip \
             -f json -o pip-audit.json || [ $? -eq 1 ]
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: report-sca
@@ -93,10 +98,10 @@ jobs:
   dockerfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Hadolint
         run: |
-          docker run --rm -i hadolint/hadolint hadolint -f json - < Dockerfile > hadolint.json || [ $? -eq 1 ]
+          docker run --rm -i hadolint/hadolint:v2.15.1 hadolint -f json - < Dockerfile > hadolint.json || [ $? -eq 1 ]
       - name: Trivy config (Dockerfile misconfig)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -106,7 +111,7 @@ jobs:
           output: trivy-config.json
           severity: HIGH,CRITICAL
           exit-code: "0"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: report-dockerfile
@@ -115,91 +120,123 @@ jobs:
             trivy-config.json
           if-no-files-found: ignore
 
-  image-scan:
+  build:                       # image BIR MARTA quriladi
+    runs-on: ubuntu-latest
+    outputs:
+      image_id: ${{ steps.meta.outputs.image_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: docker build -t app:ci .
+      - name: Record image ID
+        id: meta
+        run: echo "image_id=$(docker image inspect app:ci --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+      - name: Save image
+        run: docker save app:ci -o image.tar
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+
+  image-scan:                  # aynan shu image skanerlanadi
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Build
-        run: docker build -t $IMAGE:${{ github.sha }} .
-
-      - name: Trivy SARIF (Security tab uchun)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+      - name: Trivy image (JSON, gate uchun)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          input: image.tar
+          format: json
+          output: trivy-image.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+      - name: Trivy image (SARIF, Security tab uchun)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: image.tar
           format: sarif
           output: trivy.sarif
           severity: HIGH,CRITICAL
+          ignore-unfixed: true
           limit-severities-for-sarif: true
           exit-code: "0"
-
       - name: Upload Trivy SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: trivy.sarif
           category: trivy
-
       - name: SBOM
-        uses: anchore/sbom-action@v0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image: ${{ env.IMAGE }}:${{ github.sha }}
+          input: image.tar
           format: spdx-json
+          output: sbom.spdx.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-image
+          path: trivy-image.json
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.spdx.json
 
-      - name: Run app for DAST
+  dast:                        # informatsion: gate'ni yiqitmaydi
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+      - name: Run app
         run: |
-          docker run -d --name app -p 127.0.0.1:5000:5000 $IMAGE:${{ github.sha }}
+          docker load -i image.tar
+          docker run -d --name app -p 127.0.0.1:5000:5000 app:ci
           for i in $(seq 1 20); do
             curl -s -o /dev/null http://127.0.0.1:5000/user && break
             sleep 2
           done
           docker logs app
-
-      - name: ZAP baseline (passiv DAST)
+      - name: ZAP baseline (passiv)
         run: |
           chmod 777 "$PWD"
           docker run --rm --network host -v "$PWD":/zap/wrk:rw \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py -t "http://127.0.0.1:5000/user?name=test" \
             -r zap-report.html -I
-
-      - name: Trivy image (JSON hisobot)
-        if: always()
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
-          format: json
-          output: trivy-image.json
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "0"
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: report-image
-          path: |
-            trivy-image.json
-            zap-report.html
+          name: report-dast
+          path: zap-report.html
           if-no-files-found: ignore
 
   report:
-    needs: [secrets, sast, sca, dockerfile, image-scan]
+    name: security-gate        # branch protection'da shu nom tanlanadi
+    needs: [build, secrets, sast, sca, dockerfile, image-scan, dast]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: report-*
           merge-multiple: true
           path: reports
-
-      - name: Build report (reyting + PDF)
+      - name: Build report (gate qoidalari + PDF)
         env:
+          STATUS_BUILD: ${{ needs.build.result }}
           STATUS_SECRETS: ${{ needs.secrets.result }}
           STATUS_SAST: ${{ needs.sast.result }}
           STATUS_SCA: ${{ needs.sca.result }}
@@ -210,23 +247,21 @@ jobs:
           google-chrome --headless=new --no-sandbox --disable-gpu --no-pdf-header-footer \
             --print-to-pdf=security-report.pdf "file://$PWD/security-report.html"
           ls -la security-report.*
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: security-report
           path: |
             security-report.pdf
             reports/
-
       - name: Quality gate
         run: |
           source gate.env
-          echo "Umumiy reyting: $SCORE / 5 (minimum: $MIN_SCORE)"
+          echo "Gate: PASSED=$PASSED | buzilgan qoidalar: $VIOLATIONS | reyting (info): $SCORE / 5"
           [ "$PASSED" = "true" ]
 
-  publish:   # faqat reyting o'tgandan keyin va faqat main'da
-    needs: [report]
+  publish:                     # faqat gate o'tgandan keyin, faqat main'da
+    needs: [build, report]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -234,18 +269,24 @@ jobs:
       packages: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: docker build -t $IMAGE:${{ github.sha }} .
-      - uses: docker/login-action@v3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+      - name: Load and verify the SAME image that was scanned
+        run: |
+          docker load -i image.tar
+          test "$(docker image inspect app:ci --format '{{.Id}}')" = "${{ needs.build.outputs.image_id }}"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push
-        run: docker push $IMAGE:${{ github.sha }}
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign image (keyless)
+        id: push
         run: |
-          REF=$(docker inspect --format '{{index .RepoDigests 0}}' $IMAGE:${{ github.sha }})
-          cosign sign --yes "$REF"
+          docker tag app:ci $IMAGE:sha-${{ github.sha }}
+          docker push $IMAGE:sha-${{ github.sha }}
+          echo "ref=$(docker inspect --format '{{index .RepoDigests 0}}' $IMAGE:sha-${{ github.sha }})" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign image by digest (keyless)
+        run: cosign sign --yes "${{ steps.push.outputs.ref }}"

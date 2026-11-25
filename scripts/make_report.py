@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Skaner natijalarini (JSON) yig'adi, reyting (0-5) hisoblaydi va HTML hisobot yozadi."""
+"""Skaner natijalarini (JSON) yig'adi, GATE qoidalarini tekshiradi, HTML hisobot yozadi.
+
+Pipeline o'tadimi yoki yo'qmi, QOIDALAR bilan hal qilinadi (R1..R5).
+Reyting (0-5) faqat ma'lumot uchun ko'rsatiladi.
+"""
 import datetime
 import html
 import json
@@ -8,26 +12,41 @@ import re
 
 REP = "reports"
 MAX_SCORE = 5.0
-try:
-    MIN_SCORE = float(os.environ.get("MIN_SCORE", "4.0"))
-except ValueError:
-    MIN_SCORE = 4.0
 
 RANK = {"CRITICAL": 0, "HIGH": 1, "?": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+
+def threshold(name, default):
+    v = os.environ.get(name, default).upper()
+    return v if v in ("CRITICAL", "HIGH", "MEDIUM", "LOW") else default
+
+
+# ---- GATE sozlamalari (workflow'dagi env orqali o'zgartiriladi) ----
+SAST_FAIL_ON = threshold("SAST_FAIL_ON", "MEDIUM")    # R2: shu daraja va undan yuqori
+IMAGE_FAIL_ON = threshold("IMAGE_FAIL_ON", "HIGH")    # R4: shu daraja va undan yuqori
+
+RULES = [
+    ("R1", "Secrets", "har qanday topilma"),
+    ("R2", "SAST", "%s va undan yuqori" % SAST_FAIL_ON),
+    ("R3", "SCA", "tuzatilgan versiyasi mavjud har qanday zaif paket"),
+    ("R4", "Image", "%s va undan yuqori (faqat tuzatilgani bor)" % IMAGE_FAIL_ON),
+    ("R5", "Dockerfile", "HIGH+ noto'g'ri sozlama (root user, latest tag...) yoki Hadolint error"),
+]
+
 COLORS = {"CRITICAL": "#82071e", "HIGH": "#cf222e", "?": "#cf222e",
           "MEDIUM": "#9a6700", "LOW": "#0969da", "INFO": "#57606a"}
-# Har bir (takrorlanmas) topilma uchun jarima ballari
 PENALTY = {"CRITICAL": 1.5, "HIGH": 1.0, "?": 1.0, "MEDIUM": 0.5, "LOW": 0.1, "INFO": 0.0}
 CATEGORY = {"Gitleaks": "Secrets", "Bandit": "SAST", "Semgrep": "SAST",
             "pip-audit": "SCA", "Hadolint": "Dockerfile", "Trivy config": "Dockerfile",
             "Trivy image": "Image"}
 CATS = ["Secrets", "SAST", "SCA", "Dockerfile", "Image"]
-JOBS = [("secrets", "STATUS_SECRETS"), ("sast", "STATUS_SAST"), ("sca", "STATUS_SCA"),
-        ("dockerfile", "STATUS_DOCKERFILE"), ("image-scan", "STATUS_IMAGE")]
+JOBS = [("build", "STATUS_BUILD"), ("secrets", "STATUS_SECRETS"), ("sast", "STATUS_SAST"),
+        ("sca", "STATUS_SCA"), ("dockerfile", "STATUS_DOCKERFILE"), ("image-scan", "STATUS_IMAGE")]
 
 findings = []
 notes = []
 problems = []
+violations = []
 
 HINTS = [
     (("b608", "sql"),
@@ -47,6 +66,14 @@ HADOLINT = {
     "DL3042": "pip'ga --no-cache-dir qo'shing: RUN pip install --no-cache-dir -r requirements.txt",
     "DL3013": "pip paketlarini aniq versiya bilan pin qiling (==)",
 }
+
+
+def at_least(sev, thr):
+    return RANK.get(sev, 5) <= RANK[thr]
+
+
+def violate(rule, where, detail):
+    violations.append(dict(rule=rule, where=where, detail=detail))
 
 
 def hint(*texts):
@@ -102,27 +129,35 @@ def req_line(name):
     return ""
 
 
-# --- Bandit
+# --- Bandit (R2)
 for r in (load("bandit.json") or {}).get("results", []):
+    where = "%s:%s" % (norm(r["filename"]), r["line_number"])
     add(r["issue_severity"], "Bandit", norm(r["filename"]), r["line_number"],
         "%s: %s" % (r["test_id"], r["issue_text"]),
         hint(r["test_id"], r["test_name"], r["issue_text"]))
+    if at_least(r["issue_severity"], SAST_FAIL_ON):
+        violate("R2", where, "Bandit %s (%s)" % (r["test_id"], r["issue_severity"]))
 
-# --- Semgrep
+# --- Semgrep (R2)
 SEMGREP_SEV = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
 for r in (load("semgrep.json") or {}).get("results", []):
     ex = r.get("extra", {})
     msg = " ".join(ex.get("message", r["check_id"]).split())[:300]
-    add(SEMGREP_SEV.get(ex.get("severity"), "MEDIUM"), "Semgrep", norm(r["path"]),
-        r["start"]["line"], msg, hint(r["check_id"], msg))
+    sev = SEMGREP_SEV.get(ex.get("severity"), "MEDIUM")
+    add(sev, "Semgrep", norm(r["path"]), r["start"]["line"], msg, hint(r["check_id"], msg))
+    if at_least(sev, SAST_FAIL_ON):
+        violate("R2", "%s:%s" % (norm(r["path"]), r["start"]["line"]),
+                "Semgrep %s (%s)" % (r["check_id"].split(".")[-1], sev))
 
-# --- Gitleaks (topilgan qiymat hisobotga yozilmaydi)
+# --- Gitleaks (R1; topilgan qiymat hisobotga yozilmaydi)
 for r in load("gitleaks.json") or []:
     add("HIGH", "Gitleaks", norm(r.get("File")), r.get("StartLine"),
         "Secret topildi: %s" % r.get("Description"),
         hint("secret"), code="[yashirilgan]")
+    violate("R1", "%s:%s" % (norm(r.get("File")), r.get("StartLine")),
+            "Secret topildi: %s" % r.get("Description"))
 
-# --- pip-audit: har bir paket uchun BITTA qator
+# --- pip-audit (R3): har bir paket uchun BITTA qator
 for dep in (load("pip-audit.json") or {}).get("dependencies", []):
     vulns = dep.get("vulns") or []
     if not vulns:
@@ -137,26 +172,35 @@ for dep in (load("pip-audit.json") or {}).get("dependencies", []):
     fix = ("Qatorni quyidagiga almashtiring: %s==%s" % (dep["name"], rec)) if rec \
         else "Tuzatilgan versiya yo'q: boshqa kutubxonaga o'ting"
     count = len(set(v["id"] for v in vulns))
-    add("?", "pip-audit", "app/requirements.txt", req_line(dep["name"]),
+    line = req_line(dep["name"])
+    add("?", "pip-audit", "app/requirements.txt", line,
         "%s %s: %d ta zaiflik (%s%s)" % (dep["name"], dep["version"], count,
                                        ", ".join(ids[:5]), " ..." if len(ids) > 5 else ""),
         fix)
+    if rec:
+        violate("R3", "app/requirements.txt:%s" % line,
+                "%s %s -> %s (%d ta zaiflik)" % (dep["name"], dep["version"], rec, count))
 
-# --- Hadolint
+# --- Hadolint (R5: faqat error)
 LEVEL = {"error": "HIGH", "warning": "MEDIUM", "info": "LOW", "style": "INFO"}
 for r in load("hadolint.json") or []:
-    add(LEVEL.get(r.get("level"), "LOW"), "Hadolint", "Dockerfile", r["line"],
-        "%s: %s" % (r["code"], r["message"]),
+    sev = LEVEL.get(r.get("level"), "LOW")
+    add(sev, "Hadolint", "Dockerfile", r["line"], "%s: %s" % (r["code"], r["message"]),
         HADOLINT.get(r["code"], "https://github.com/hadolint/hadolint/wiki/" + r["code"]))
+    if sev == "HIGH":
+        violate("R5", "Dockerfile:%s" % r["line"], "Hadolint %s" % r["code"])
 
-# --- Trivy config
+# --- Trivy config (R5)
 for res in (load("trivy-config.json") or {}).get("Results", []):
     for m in res.get("Misconfigurations") or []:
         line = (m.get("CauseMetadata") or {}).get("StartLine") or ""
         add(m["Severity"], "Trivy config", res["Target"], line,
             "%s: %s" % (m["ID"], m["Title"]), m.get("Resolution", ""))
+        if at_least(m["Severity"], "HIGH"):
+            violate("R5", res["Target"] + (":%s" % line if line != "" else ""),
+                    "%s: %s" % (m["ID"], m["Title"]))
 
-# --- Trivy image: paket bo'yicha guruhlab (reyting HAMMASINI sanaydi, jadval 25 tasini ko'rsatadi)
+# --- Trivy image (R4): paket bo'yicha guruhlab; qoida HAMMASINI sanaydi, jadval 25 tasini ko'rsatadi
 groups = {}
 for res in (load("trivy-image.json") or {}).get("Results", []):
     for v in res.get("Vulnerabilities") or []:
@@ -177,6 +221,12 @@ for (cls, target, pkg, ver, fixed), g in items[:25]:
 if len(items) > 25:
     notes.append("Image skanida yana %d ta paket topilgan, bu yerda eng og'ir 25 tasi. "
                  "To'liq ro'yxat: report-image artifact'idagi trivy-image.json." % (len(items) - 25))
+hit = [g for g in groups.values() if at_least(g["sev"], IMAGE_FAIL_ON)]
+if hit:
+    crit = sum(1 for g in hit if g["sev"] == "CRITICAL")
+    violate("R4", "Dockerfile:1 (base image / paketlar)",
+            "%d ta paket (CRITICAL %d, boshqalar %d), hammasining tuzatilgan versiyasi bor"
+            % (len(hit), crit, len(hit) - crit))
 
 # --- Umumiy eslatmalar
 try:
@@ -188,8 +238,8 @@ if any(f["tool"] == "pip-audit" for f in findings) and re.search(r"python:3\.[0-
     notes.append("Yangi kutubxona versiyalari Python 3.9+ talab qiladi, shuning uchun "
                  "Dockerfile'ning birinchi qatorini ham almashtiring: FROM python:3.12-slim")
 
-# --- REYTING
-scored = {}   # takrorlanmas topilma -> (kategoriya, jarima)
+# --- Reyting (faqat ma'lumot uchun): kategoriya = 5 - jarimalar, umumiy = o'rtacha
+scored = {}
 
 
 def put(key, cat, p):
@@ -211,11 +261,11 @@ cat_cnt = dict((c, 0) for c in CATS)
 for cat, p in scored.values():
     cat_pen[cat] += p
     cat_cnt[cat] += 1
-score = round(max(0.0, MAX_SCORE - sum(cat_pen.values())), 1)
 cat_score = dict((c, round(max(0.0, MAX_SCORE - cat_pen[c]), 1)) for c in CATS)
+score = round(sum(max(0.0, MAX_SCORE - cat_pen[c]) for c in CATS) / len(CATS), 2)
 
 bad_jobs = [name for name, env in JOBS if os.environ.get(env, "success") != "success"]
-passed = score >= MIN_SCORE and not problems and not bad_jobs
+passed = not violations and not problems and not bad_jobs
 
 # --- HTML
 STATUS = [
@@ -234,10 +284,6 @@ def sort_key(f):
     return (RANK.get(f["sev"], 5), f["file"], ln)
 
 
-def col_of(s):
-    return "#1a7f37" if s >= MIN_SCORE else ("#9a6700" if s >= MIN_SCORE - 1.5 else "#cf222e")
-
-
 findings.sort(key=sort_key)
 box = "#1a7f37" if passed else "#cf222e"
 out = ["<html><head><meta charset='utf-8'><style>",
@@ -252,29 +298,44 @@ out = ["<html><head><meta charset='utf-8'><style>",
        ".note{background:#fff8c5;border:1px solid #d4a72c;padding:6px;margin:6px 0}",
        ".err{background:#ffebe9;border:1px solid #cf222e;padding:6px;margin:6px 0}",
        ".score{border:3px solid %s;padding:10px;margin:8px 0}" % box,
-       ".score .n{font-size:34px;font-weight:bold;color:%s}" % box,
+       ".score .n{font-size:24px;font-weight:bold;color:%s}" % box,
        "</style></head><body>",
        "<h1>DevSecOps hisobot: nimani, qayerda tuzatish kerak</h1>",
        "<p>Repo: %s &nbsp; Commit: %s &nbsp; Run: %s &nbsp; Sana: %s</p>" % (
            esc(os.environ.get("GITHUB_REPOSITORY", "")), esc(os.environ.get("GITHUB_SHA", "")[:12]),
            esc(os.environ.get("GITHUB_RUN_ID", "")),
            datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
-       "<div class='score'><span class='n'>%.1f / %.0f</span> &nbsp; <b>Umumiy reyting</b> &nbsp; "
-       "<b style='color:%s;font-size:14px'>%s</b> &nbsp; (o'tish chegarasi: %.1f)</div>" % (
-           score, MAX_SCORE, box, "PIPELINE O'TDI" if passed else "PIPELINE YIQILDI", MIN_SCORE)]
+       "<div class='score'><span class='n'>%s</span> &nbsp; Gate qoidalari buzilishi: <b>%d</b> "
+       "&nbsp;|&nbsp; Reyting (faqat ma'lumot uchun): <b>%.2f / %.0f</b></div>" % (
+           "PIPELINE O'TDI" if passed else "PIPELINE YIQILDI", len(violations), score, MAX_SCORE)]
 if problems or bad_jobs:
-    out.append("<div class='err'><b>Skaner xatolari (reyting ishonchsiz, pipeline yiqiladi):</b><br>%s</div>"
-               % esc("; ".join(problems + ["job '%s' yiqilgan" % j for j in bad_jobs])))
-out.append("<h2>Kategoriyalar bo'yicha reyting</h2><table><tr><th>Kategoriya</th><th>Reyting</th>"
-           "<th>Topilmalar</th><th>Jarima</th></tr>")
+    out.append("<div class='err'><b>Skaner xatolari (natijaga ishonib bo'lmaydi, pipeline yiqiladi):</b><br>%s</div>"
+               % esc("; ".join(problems + ["job '%s' muvaffaqiyatsiz" % j for j in bad_jobs])))
+
+out.append("<h2>Gate qoidalari</h2><table><tr><th style='width:6%'>Qoida</th><th style='width:12%'>Kategoriya</th>"
+           "<th>Shart (shu bo'lsa pipeline yiqiladi)</th><th style='width:10%'>Buzilgan</th>"
+           "<th style='width:10%'>Holat</th></tr>")
+for rid, cat, cond in RULES:
+    n = sum(1 for v in violations if v["rule"] == rid)
+    out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td style='color:%s'><b>%s</b></td></tr>"
+               % (rid, esc(cat), esc(cond), n, "#cf222e" if n else "#1a7f37", "BUZILGAN" if n else "OK"))
+out.append("</table>")
+if violations:
+    out.append("<h2>Buzilishlar (pipeline'ni to'xtatayotgan topilmalar)</h2><table><tr><th style='width:6%'>Qoida</th>"
+               "<th style='width:26%'>Joyi</th><th>Tafsilot</th></tr>")
+    for v in violations:
+        out.append("<tr><td>%s</td><td><b>%s</b></td><td>%s</td></tr>"
+                   % (v["rule"], esc(v["where"]), esc(v["detail"])))
+    out.append("</table>")
+
+out.append("<h2>Kategoriyalar bo'yicha reyting (faqat ma'lumot uchun)</h2><table><tr><th>Kategoriya</th>"
+           "<th>Reyting</th><th>Topilmalar</th><th>Jarima</th></tr>")
 for c in CATS:
-    out.append("<tr><td>%s</td><td style='color:%s'><b>%.1f / %.0f</b></td><td>%d</td><td>-%.1f</td></tr>"
-               % (esc(c), col_of(cat_score[c]), cat_score[c], MAX_SCORE, cat_cnt[c], cat_pen[c]))
-out.append("</table><p>Hisoblash: reyting %.0f dan boshlanadi, har bir topilma uchun jarima ayriladi: "
-           "CRITICAL -1.5, HIGH -1.0 (pip-audit ham HIGH deb olinadi), MEDIUM -0.5, LOW -0.1. "
-           "Umumiy reyting = %.0f - barcha jarimalar yig'indisi (0 dan past tushmaydi). "
-           "Bir qatordagi bir xil muammo (masalan Bandit va Semgrep) bir marta sanaladi.</p>"
-           % (MAX_SCORE, MAX_SCORE))
+    out.append("<tr><td>%s</td><td><b>%.1f / %.0f</b></td><td>%d</td><td>-%.1f</td></tr>"
+               % (esc(c), cat_score[c], MAX_SCORE, cat_cnt[c], min(cat_pen[c], MAX_SCORE)))
+out.append("</table><p>Reyting: har bir kategoriya %.0f dan boshlanadi, jarima: CRITICAL -1.5, HIGH -1.0, "
+           "MEDIUM -0.5, LOW -0.1. Umumiy = 5 kategoriya o'rtachasi. Pipeline'ni reyting emas, "
+           "yuqoridagi qoidalar to'xtatadi.</p>" % MAX_SCORE)
 out.append("<h2>Skanerlar</h2><table><tr><th>Skaner</th><th>Job holati</th><th>Topilmalar</th></tr>")
 for tool, env in STATUS:
     st = os.environ.get(env, "success")
@@ -285,7 +346,7 @@ for tool, env in STATUS:
 out.append("</table>")
 for n in notes:
     out.append("<div class='note'><b>Muhim:</b> %s</div>" % esc(n))
-out.append("<h2>Tuzatish ro'yxati (og'irlik bo'yicha)</h2>")
+out.append("<h2>Barcha topilmalar (og'irlik bo'yicha)</h2>")
 if findings:
     out.append("<table><tr><th style='width:3%'>#</th><th style='width:7%'>Daraja</th>"
                "<th style='width:8%'>Skaner</th><th style='width:13%'>Fayl:qator</th>"
@@ -301,21 +362,24 @@ if findings:
     out.append("</table>")
 else:
     out.append("<p>Hech qanday topilma yo'q.</p>")
-out.append("<p>ZAP (DAST) hisoboti alohida fayl: reports/zap-report.html</p></body></html>")
+out.append("<p>ZAP (DAST) hisoboti alohida fayl: reports/zap-report.html (informatsion, gate'ga ta'sir qilmaydi)</p>"
+           "</body></html>")
 with open("security-report.html", "w", encoding="utf-8") as fh:
     fh.write("\n".join(out))
 
 # --- Gate natijasi (workflow oxirgi qadamda shuni o'qiydi) va run xulosasi
 with open("gate.env", "w", encoding="utf-8") as fh:
-    fh.write("SCORE=%.1f\nMIN_SCORE=%.1f\nPASSED=%s\n" % (score, MIN_SCORE, "true" if passed else "false"))
+    fh.write("PASSED=%s\nVIOLATIONS=%d\nSCORE=%.2f\n" % ("true" if passed else "false", len(violations), score))
 summary = os.environ.get("GITHUB_STEP_SUMMARY")
 if summary:
     with open(summary, "a", encoding="utf-8") as fh:
-        fh.write("## Security rating: %.1f / %.0f - %s (min %.1f)\n\n| Kategoriya | Reyting | Topilmalar |\n|---|---|---|\n"
-                 % (score, MAX_SCORE, "PASS" if passed else "FAIL", MIN_SCORE))
-        for c in CATS:
-            fh.write("| %s | %.1f | %d |\n" % (c, cat_score[c], cat_cnt[c]))
+        fh.write("## Security gate: %s\n\nBuzilgan qoidalar: **%d** | Reyting (ma'lumot uchun): %.2f / %.0f\n\n"
+                 % ("PASS" if passed else "FAIL", len(violations), score, MAX_SCORE))
+        if violations:
+            fh.write("| Qoida | Joyi | Tafsilot |\n|---|---|---|\n")
+            for v in violations[:40]:
+                fh.write("| %s | `%s` | %s |\n" % (v["rule"], v["where"], v["detail"].replace("|", "/")))
         for p in problems + bad_jobs:
             fh.write("\n:warning: %s\n" % p)
-print("findings: %d | score: %.1f / %.0f | min: %.1f | passed: %s" %
-      (len(findings), score, MAX_SCORE, MIN_SCORE, passed))
+print("findings: %d | violations: %d | rating: %.2f / %.0f | passed: %s" %
+      (len(findings), len(violations), score, MAX_SCORE, passed))
