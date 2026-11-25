@@ -31,9 +31,15 @@ jobs:
           fetch-depth: 0
       - name: Gitleaks
         run: |
-          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/repo" \
-            zricethezav/gitleaks:v8.30.1 git /repo --log-opts="-1" -v --redact --no-banner \
-            --report-format json --report-path /repo/gitleaks.json || [ $? -eq 1 ]
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD:/repo" \
+            zricethezav/gitleaks:v8.30.1 \
+            git /repo --log-opts="-1" \
+            -v --redact --no-banner \
+            --report-format json \
+            --report-path /repo/gitleaks.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -260,33 +266,84 @@ jobs:
           echo "Gate: PASSED=$PASSED | buzilgan qoidalar: $VIOLATIONS | reyting (info): $SCORE / 5"
           [ "$PASSED" = "true" ]
 
-  publish:                     # faqat gate o'tgandan keyin, faqat main'da
+  
+  publish:
     needs: [build, report]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       packages: write
       id-token: write
+
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image
-      - name: Load and verify the SAME image that was scanned
+
+      - name: Load and verify the SAME image
         run: |
           docker load -i image.tar
-          test "$(docker image inspect app:ci --format '{{.Id}}')" = "${{ needs.build.outputs.image_id }}"
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+
+          ACTUAL_ID=$(docker image inspect app:ci --format '{{.Id}}')
+          EXPECTED_ID="${{ needs.build.outputs.image_id }}"
+
+          if [ "$ACTUAL_ID" != "$EXPECTED_ID" ]; then
+            echo "Image ID mismatch!"
+            exit 1
+          fi
+
+          echo "Image verification successful"
+
+      - uses: docker/login-action@8aa5831fb1d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push
+
+      - name: Push image
         id: push
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
         run: |
-          docker tag app:ci $IMAGE:sha-${{ github.sha }}
-          docker push $IMAGE:sha-${{ github.sha }}
-          echo "ref=$(docker inspect --format '{{index .RepoDigests 0}}' $IMAGE:sha-${{ github.sha }})" >> "$GITHUB_OUTPUT"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+
+          TAG="sha-${GITHUB_SHA}"
+
+          docker tag app:ci "$IMAGE:$TAG"
+
+          docker push "$IMAGE:$TAG" 2>&1 | tee /tmp/push.log
+
+          DIGEST=$(awk '/digest: sha256:/ {
+            for (i=1; i<=NF; i++) {
+              if ($i ~ /^sha256:/) {
+                print $i
+                exit
+              }
+            }
+          }' /tmp/push.log)
+
+          if [ -z "$DIGEST" ]; then
+            echo "Failed to get image digest"
+            exit 1
+          fi
+
+          IMAGE_REF="${IMAGE}@${DIGEST}"
+
+          echo "Image reference: $IMAGE_REF"
+          echo "ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
       - name: Sign image by digest (keyless)
-        run: cosign sign --yes "${{ steps.push.outputs.ref }}"
+        run: |
+          echo "Signing: ${{ steps.push.outputs.ref }}"
+          cosign sign --yes "${{ steps.push.outputs.ref }}"
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            "${{ steps.push.outputs.ref }}" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
