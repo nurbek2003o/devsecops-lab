@@ -15,6 +15,7 @@ defaults:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  MIN_SCORE: "4.0"     # o'tish chegarasi (5 dan)
 
 jobs:
   secrets:
@@ -27,7 +28,7 @@ jobs:
         run: |
           docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/repo" \
             zricethezav/gitleaks:latest detect --source /repo -v --redact --no-banner \
-            --report-format json --report-path /repo/gitleaks.json
+            --report-format json --report-path /repo/gitleaks.json || [ $? -eq 1 ]
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -45,17 +46,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Bandit (JSON)
+      - name: Bandit
         run: |
           pip install bandit
-          bandit -r app -f json -o bandit.json || true
-      - name: Bandit (gate)
-        run: bandit -r app
+          bandit -r app -f json -o bandit.json || [ $? -eq 1 ]
       - name: Semgrep
         if: always()
         run: |
           pip install semgrep
-          semgrep scan --error --config p/python --config p/flask --config p/secrets \
+          semgrep scan --config p/python --config p/flask --config p/secrets \
             --json-output=semgrep.json --sarif-output=semgrep.sarif app/
       - name: Upload Semgrep SARIF
         if: always() && hashFiles('semgrep.sarif') != ''
@@ -79,12 +78,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: pip-audit (JSON)
+      - name: pip-audit
         run: |
           pip install pip-audit
-          pip-audit -r app/requirements.txt --no-deps --disable-pip -f json -o pip-audit.json || true
-      - name: pip-audit (gate)
-        run: pip-audit -r app/requirements.txt --no-deps --disable-pip
+          pip-audit -r app/requirements.txt --no-deps --disable-pip \
+            -f json -o pip-audit.json || [ $? -eq 1 ]
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -96,12 +94,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Hadolint (JSON)
-        run: docker run --rm -i hadolint/hadolint hadolint -f json - < Dockerfile > hadolint.json || true
-      - name: Hadolint (gate)
-        run: docker run --rm -i hadolint/hadolint hadolint --failure-threshold warning - < Dockerfile
+      - name: Hadolint
+        run: |
+          docker run --rm -i hadolint/hadolint hadolint -f json - < Dockerfile > hadolint.json || [ $? -eq 1 ]
       - name: Trivy config (Dockerfile misconfig)
-        if: always()
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: config
@@ -109,7 +105,7 @@ jobs:
           format: json
           output: trivy-config.json
           severity: HIGH,CRITICAL
-          exit-code: "1"
+          exit-code: "0"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -119,7 +115,7 @@ jobs:
             trivy-config.json
           if-no-files-found: ignore
 
-  image-scan:   # needs YO'Q: har doim ishlaydi, hisobot to'liq bo'ladi
+  image-scan:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -169,7 +165,7 @@ jobs:
             zap-baseline.py -t "http://127.0.0.1:5000/user?name=test" \
             -r zap-report.html -I
 
-      - name: Trivy image (gate + JSON hisobot)
+      - name: Trivy image (JSON hisobot)
         if: always()
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -178,7 +174,7 @@ jobs:
           output: trivy-image.json
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          exit-code: "1"
+          exit-code: "0"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -202,7 +198,7 @@ jobs:
           merge-multiple: true
           path: reports
 
-      - name: Build report
+      - name: Build report (reyting + PDF)
         env:
           STATUS_SECRETS: ${{ needs.secrets.result }}
           STATUS_SAST: ${{ needs.sast.result }}
@@ -216,14 +212,21 @@ jobs:
           ls -la security-report.*
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: security-report
           path: |
             security-report.pdf
             reports/
 
-  publish:   # faqat hamma skaner yashil bo'lsa va faqat main'da
-    needs: [secrets, sast, sca, dockerfile, image-scan]
+      - name: Quality gate
+        run: |
+          source gate.env
+          echo "Umumiy reyting: $SCORE / 5 (minimum: $MIN_SCORE)"
+          [ "$PASSED" = "true" ]
+
+  publish:   # faqat reyting o'tgandan keyin va faqat main'da
+    needs: [report]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

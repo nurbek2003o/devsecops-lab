@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Skaner natijalarini (JSON) bitta tushunarli HTML hisobotga yig'adi."""
+"""Skaner natijalarini (JSON) yig'adi, reyting (0-5) hisoblaydi va HTML hisobot yozadi."""
 import datetime
 import html
 import json
@@ -7,11 +7,27 @@ import os
 import re
 
 REP = "reports"
+MAX_SCORE = 5.0
+try:
+    MIN_SCORE = float(os.environ.get("MIN_SCORE", "4.0"))
+except ValueError:
+    MIN_SCORE = 4.0
+
 RANK = {"CRITICAL": 0, "HIGH": 1, "?": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 COLORS = {"CRITICAL": "#82071e", "HIGH": "#cf222e", "?": "#cf222e",
           "MEDIUM": "#9a6700", "LOW": "#0969da", "INFO": "#57606a"}
+# Har bir (takrorlanmas) topilma uchun jarima ballari
+PENALTY = {"CRITICAL": 1.5, "HIGH": 1.0, "?": 1.0, "MEDIUM": 0.5, "LOW": 0.1, "INFO": 0.0}
+CATEGORY = {"Gitleaks": "Secrets", "Bandit": "SAST", "Semgrep": "SAST",
+            "pip-audit": "SCA", "Hadolint": "Dockerfile", "Trivy config": "Dockerfile",
+            "Trivy image": "Image"}
+CATS = ["Secrets", "SAST", "SCA", "Dockerfile", "Image"]
+JOBS = [("secrets", "STATUS_SECRETS"), ("sast", "STATUS_SAST"), ("sca", "STATUS_SCA"),
+        ("dockerfile", "STATUS_DOCKERFILE"), ("image-scan", "STATUS_IMAGE")]
+
 findings = []
 notes = []
+problems = []
 
 HINTS = [
     (("b608", "sql"),
@@ -50,6 +66,7 @@ def load(name):
         with open(os.path.join(REP, name), encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        problems.append("%s topilmadi yoki o'qib bo'lmadi: skaner ishlamagan bo'lishi mumkin" % name)
         return None
 
 
@@ -139,7 +156,7 @@ for res in (load("trivy-config.json") or {}).get("Results", []):
         add(m["Severity"], "Trivy config", res["Target"], line,
             "%s: %s" % (m["ID"], m["Title"]), m.get("Resolution", ""))
 
-# --- Trivy image: paket bo'yicha guruhlab, eng og'irlari
+# --- Trivy image: paket bo'yicha guruhlab (reyting HAMMASINI sanaydi, jadval 25 tasini ko'rsatadi)
 groups = {}
 for res in (load("trivy-image.json") or {}).get("Results", []):
     for v in res.get("Vulnerabilities") or []:
@@ -171,6 +188,35 @@ if any(f["tool"] == "pip-audit" for f in findings) and re.search(r"python:3\.[0-
     notes.append("Yangi kutubxona versiyalari Python 3.9+ talab qiladi, shuning uchun "
                  "Dockerfile'ning birinchi qatorini ham almashtiring: FROM python:3.12-slim")
 
+# --- REYTING
+scored = {}   # takrorlanmas topilma -> (kategoriya, jarima)
+
+
+def put(key, cat, p):
+    if key not in scored or p > scored[key][1]:
+        scored[key] = (cat, p)
+
+
+for f in findings:
+    if f["tool"] == "Trivy image":
+        continue
+    cat = CATEGORY[f["tool"]]
+    put((cat, f["file"], f["line"] if f["line"] != "" else f["title"]), cat,
+        PENALTY.get(f["sev"], 0.5))
+for k, g in groups.items():
+    put(("Image",) + k, "Image", PENALTY.get(g["sev"], 0.5))
+
+cat_pen = dict((c, 0.0) for c in CATS)
+cat_cnt = dict((c, 0) for c in CATS)
+for cat, p in scored.values():
+    cat_pen[cat] += p
+    cat_cnt[cat] += 1
+score = round(max(0.0, MAX_SCORE - sum(cat_pen.values())), 1)
+cat_score = dict((c, round(max(0.0, MAX_SCORE - cat_pen[c]), 1)) for c in CATS)
+
+bad_jobs = [name for name, env in JOBS if os.environ.get(env, "success") != "success"]
+passed = score >= MIN_SCORE and not problems and not bad_jobs
+
 # --- HTML
 STATUS = [
     ("Gitleaks", "STATUS_SECRETS"), ("Bandit", "STATUS_SAST"), ("Semgrep", "STATUS_SAST"),
@@ -188,7 +234,12 @@ def sort_key(f):
     return (RANK.get(f["sev"], 5), f["file"], ln)
 
 
+def col_of(s):
+    return "#1a7f37" if s >= MIN_SCORE else ("#9a6700" if s >= MIN_SCORE - 1.5 else "#cf222e")
+
+
 findings.sort(key=sort_key)
+box = "#1a7f37" if passed else "#cf222e"
 out = ["<html><head><meta charset='utf-8'><style>",
        "@page{size:A4 landscape;margin:10mm}",
        "body{font-family:Arial,sans-serif;font-size:10px;color:#1f2328}",
@@ -199,15 +250,34 @@ out = ["<html><head><meta charset='utf-8'><style>",
        "code{font-family:monospace;font-size:9px;background:#f6f8fa;padding:1px 3px}",
        ".b{color:#fff;padding:1px 5px;border-radius:3px;font-weight:bold;font-size:9px}",
        ".note{background:#fff8c5;border:1px solid #d4a72c;padding:6px;margin:6px 0}",
+       ".err{background:#ffebe9;border:1px solid #cf222e;padding:6px;margin:6px 0}",
+       ".score{border:3px solid %s;padding:10px;margin:8px 0}" % box,
+       ".score .n{font-size:34px;font-weight:bold;color:%s}" % box,
        "</style></head><body>",
        "<h1>DevSecOps hisobot: nimani, qayerda tuzatish kerak</h1>",
        "<p>Repo: %s &nbsp; Commit: %s &nbsp; Run: %s &nbsp; Sana: %s</p>" % (
            esc(os.environ.get("GITHUB_REPOSITORY", "")), esc(os.environ.get("GITHUB_SHA", "")[:12]),
            esc(os.environ.get("GITHUB_RUN_ID", "")),
            datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
-       "<h2>Xulosa</h2><table><tr><th>Skaner</th><th>Job holati</th><th>Topilmalar</th></tr>"]
+       "<div class='score'><span class='n'>%.1f / %.0f</span> &nbsp; <b>Umumiy reyting</b> &nbsp; "
+       "<b style='color:%s;font-size:14px'>%s</b> &nbsp; (o'tish chegarasi: %.1f)</div>" % (
+           score, MAX_SCORE, box, "PIPELINE O'TDI" if passed else "PIPELINE YIQILDI", MIN_SCORE)]
+if problems or bad_jobs:
+    out.append("<div class='err'><b>Skaner xatolari (reyting ishonchsiz, pipeline yiqiladi):</b><br>%s</div>"
+               % esc("; ".join(problems + ["job '%s' yiqilgan" % j for j in bad_jobs])))
+out.append("<h2>Kategoriyalar bo'yicha reyting</h2><table><tr><th>Kategoriya</th><th>Reyting</th>"
+           "<th>Topilmalar</th><th>Jarima</th></tr>")
+for c in CATS:
+    out.append("<tr><td>%s</td><td style='color:%s'><b>%.1f / %.0f</b></td><td>%d</td><td>-%.1f</td></tr>"
+               % (esc(c), col_of(cat_score[c]), cat_score[c], MAX_SCORE, cat_cnt[c], cat_pen[c]))
+out.append("</table><p>Hisoblash: reyting %.0f dan boshlanadi, har bir topilma uchun jarima ayriladi: "
+           "CRITICAL -1.5, HIGH -1.0 (pip-audit ham HIGH deb olinadi), MEDIUM -0.5, LOW -0.1. "
+           "Umumiy reyting = %.0f - barcha jarimalar yig'indisi (0 dan past tushmaydi). "
+           "Bir qatordagi bir xil muammo (masalan Bandit va Semgrep) bir marta sanaladi.</p>"
+           % (MAX_SCORE, MAX_SCORE))
+out.append("<h2>Skanerlar</h2><table><tr><th>Skaner</th><th>Job holati</th><th>Topilmalar</th></tr>")
 for tool, env in STATUS:
-    st = os.environ.get(env, "unknown")
+    st = os.environ.get(env, "success")
     col = "#1a7f37" if st == "success" else ("#cf222e" if st == "failure" else "#9a6700")
     n = sum(1 for f in findings if f["tool"] == tool)
     out.append("<tr><td>%s</td><td style='color:%s'><b>%s</b></td><td>%d</td></tr>"
@@ -234,4 +304,18 @@ else:
 out.append("<p>ZAP (DAST) hisoboti alohida fayl: reports/zap-report.html</p></body></html>")
 with open("security-report.html", "w", encoding="utf-8") as fh:
     fh.write("\n".join(out))
-print("findings:", len(findings))
+
+# --- Gate natijasi (workflow oxirgi qadamda shuni o'qiydi) va run xulosasi
+with open("gate.env", "w", encoding="utf-8") as fh:
+    fh.write("SCORE=%.1f\nMIN_SCORE=%.1f\nPASSED=%s\n" % (score, MIN_SCORE, "true" if passed else "false"))
+summary = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary:
+    with open(summary, "a", encoding="utf-8") as fh:
+        fh.write("## Security rating: %.1f / %.0f - %s (min %.1f)\n\n| Kategoriya | Reyting | Topilmalar |\n|---|---|---|\n"
+                 % (score, MAX_SCORE, "PASS" if passed else "FAIL", MIN_SCORE))
+        for c in CATS:
+            fh.write("| %s | %.1f | %d |\n" % (c, cat_score[c], cat_cnt[c]))
+        for p in problems + bad_jobs:
+            fh.write("\n:warning: %s\n" % p)
+print("findings: %d | score: %.1f / %.0f | min: %.1f | passed: %s" %
+      (len(findings), score, MAX_SCORE, MIN_SCORE, passed))
