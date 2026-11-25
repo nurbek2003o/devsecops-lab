@@ -296,7 +296,7 @@ jobs:
 
           echo "Image verification successful"
 
-      - uses: docker/login-action@8aa5831fb1d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
